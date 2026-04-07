@@ -1,0 +1,3 @@
+Secure AES driver demo file.
+This text is encrypted in kernel space with AES-CBC and PKCS#7 padding.
+After decrypting, the restored file must match this original content exactly.

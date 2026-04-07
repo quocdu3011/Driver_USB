@@ -1,0 +1,14 @@
+app/*.o
+app/secure_file_app
+app/secure_file_gui
+driver/*.o
+driver/*.ko
+driver/*.mod
+driver/*.mod.c
+driver/*.mod.o
+driver/*.order
+driver/*.symvers
+driver/.tmp_versions/
+driver/modules.order
+driver/Module.symvers
+*.tmp

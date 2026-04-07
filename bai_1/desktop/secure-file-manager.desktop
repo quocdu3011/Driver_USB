@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Secure File Manager
+Comment=GTK frontend for the secure AES kernel driver
+Exec=secure_file_gui
+Icon=system-file-manager
+Terminal=false
+Categories=Utility;Security;
+StartupNotify=true
