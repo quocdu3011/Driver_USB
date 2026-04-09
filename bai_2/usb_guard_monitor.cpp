@@ -4,9 +4,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -34,18 +36,15 @@ const fs::path kProcMounts{"/proc/mounts"};
 struct BlockPartition {
     std::string name;
     std::uint64_t size_bytes{};
-    bool read_only{};
     std::vector<std::string> mountpoints;
 };
 
 struct BlockDevice {
     std::string name;
     std::uint64_t size_bytes{};
-    bool read_only{};
     bool removable{};
     std::vector<std::string> mountpoints;
     std::vector<BlockPartition> partitions;
-    fs::path ro_path;
 };
 
 struct ActiveDevice {
@@ -54,6 +53,8 @@ struct ActiveDevice {
     std::string devpath;
     std::string vid;
     std::string pid;
+    bool authorized{true};
+    bool authorization_supported{};
     bool whitelisted{};
     unsigned int connect_count{};
     std::uint64_t connected_for_ms{};
@@ -61,6 +62,7 @@ struct ActiveDevice {
     std::string manufacturer;
     std::string product;
     std::string serial;
+    fs::path authorized_path;
     std::vector<BlockDevice> block_devices;
 };
 
@@ -91,8 +93,7 @@ struct Options {
     double watch_interval{};
     bool json{};
     bool tui{};
-    bool readonly_untrusted{};
-    bool dry_run{};
+    bool deauthorize_untrusted{};
 };
 
 enum class TuiPage {
@@ -124,6 +125,8 @@ std::string normalized_policy_mode(const StatusSnapshot &status);
 bool whitelist_policy_active(const StatusSnapshot &status);
 std::string device_trust_label(const StatusSnapshot &status, bool whitelisted);
 TuiStyle device_trust_style(const StatusSnapshot &status, bool whitelisted);
+std::string authorization_label(const ActiveDevice &device);
+TuiStyle authorization_style(const ActiveDevice &device);
 
 class TerminalGuard {
   public:
@@ -531,9 +534,7 @@ BlockDevice collect_block_info(
 
     block.name = block_name;
     block.size_bytes = parse_u64(read_text_trimmed(block_path / "size")) * 512ULL;
-    block.read_only = read_text_trimmed(block_path / "ro", "0") == "1";
     block.removable = read_text_trimmed(block_path / "removable", "0") == "1";
-    block.ro_path = block_path / "ro";
 
     const auto mount_it = mounts.find("/dev/" + block_name);
     if (mount_it != mounts.end()) {
@@ -546,7 +547,6 @@ BlockDevice collect_block_info(
 
         part.name = partition_name;
         part.size_bytes = parse_u64(read_text_trimmed(part_path / "size")) * 512ULL;
-        part.read_only = read_text_trimmed(part_path / "ro", "0") == "1";
 
         const auto part_mount_it = mounts.find("/dev/" + partition_name);
         if (part_mount_it != mounts.end()) {
@@ -589,10 +589,24 @@ std::vector<std::string> find_usb_block_devices(const std::string &devpath) {
     return std::vector<std::string>(block_names.begin(), block_names.end());
 }
 
+void enrich_authorization(ActiveDevice &device) {
+    const fs::path authorized_path = kSysUsbDevices / device.devpath / "authorized";
+
+    device.authorized_path = authorized_path;
+    device.authorization_supported = fs::exists(authorized_path);
+    if (!device.authorization_supported) {
+        device.authorized = true;
+        return;
+    }
+
+    device.authorized = read_text_trimmed(authorized_path, "1") != "0";
+}
+
 void enrich_active_devices(StatusSnapshot &status) {
     const auto mounts = parse_mounts();
 
     for (auto &device : status.active_devices) {
+        enrich_authorization(device);
         const auto block_names = find_usb_block_devices(device.devpath);
         for (const auto &block_name : block_names) {
             device.block_devices.push_back(collect_block_info(block_name, mounts));
@@ -600,77 +614,60 @@ void enrich_active_devices(StatusSnapshot &status) {
     }
 }
 
-std::vector<std::string> apply_readonly_policy(StatusSnapshot &status, bool dry_run) {
+std::vector<std::string> apply_deauthorize_policy(StatusSnapshot &status) {
     std::vector<std::string> actions;
 
-    if (status.policy_mode != "whitelist") {
+    if (normalized_policy_mode(status) != "whitelist") {
         actions.push_back(
-            "info policy skipped: whitelist is disabled, system is running in observe mode");
+            "info deauthorize skipped: whitelist is disabled, system is running in observe mode");
         return actions;
     }
+
+    ::sync();
 
     for (auto &device : status.active_devices) {
         if (device.whitelisted) {
             continue;
         }
 
-        if (device.block_devices.empty()) {
-            std::ostringstream warning;
-            warning << "warn " << device.devpath
-                    << ": untrusted device detected but no block device is resolved yet";
-            actions.push_back(warning.str());
+        if (!device.authorization_supported || device.authorized_path.empty()) {
+            actions.push_back("warn " + device.devpath +
+                              ": authorized sysfs path is unavailable");
             continue;
         }
 
-        bool planned_or_changed = false;
-        for (auto &block : device.block_devices) {
-            if (block.read_only) {
-                continue;
-            }
-
-            if (dry_run) {
-                std::ostringstream action;
-                action << "[dry-run] set read-only " << device.devpath << " -> "
-                       << block.name;
-                actions.push_back(action.str());
-                planned_or_changed = true;
-                continue;
-            }
-
-            std::ofstream output(block.ro_path);
-            if (!output) {
-                std::ostringstream failure;
-                failure << "failed " << block.name << ": cannot open " << block.ro_path;
-                actions.push_back(failure.str());
-                continue;
-            }
-
-            output << "1\n";
-            if (!output) {
-                std::ostringstream failure;
-                failure << "failed " << block.name << ": cannot write " << block.ro_path;
-                actions.push_back(failure.str());
-                continue;
-            }
-
-            block.read_only = true;
-            planned_or_changed = true;
-            std::ostringstream action;
-            action << "applied read-only " << device.devpath << " -> " << block.name;
-            actions.push_back(action.str());
+        if (!device.authorized) {
+            actions.push_back("info " + device.devpath +
+                              ": device is already deauthorized");
+            continue;
         }
 
-        if (!planned_or_changed) {
-            std::ostringstream info;
-            info << "info " << device.devpath
-                 << ": all resolved block devices are already read-only";
-            actions.push_back(info.str());
+        std::ofstream output(device.authorized_path);
+        if (!output) {
+            actions.push_back("failed " + device.devpath + ": cannot open " +
+                              device.authorized_path.string());
+            continue;
         }
+
+        output << "0\n";
+        if (!output) {
+            actions.push_back("failed " + device.devpath + ": cannot write " +
+                              device.authorized_path.string());
+            continue;
+        }
+
+        device.authorized = false;
+        actions.push_back("deauthorized " + device.devpath + " via " +
+                          device.authorized_path.string());
+    }
+
+    if (actions.empty()) {
+        actions.push_back(
+            "info deauthorize skipped: no untrusted active USB devices were found");
     }
 
     return actions;
 }
-
 std::string normalized_policy_mode(const StatusSnapshot &status) {
     if (!status.policy_mode.empty()) {
         return status.policy_mode;
@@ -750,7 +747,6 @@ void render_json_block_partition(std::ostream &out, const BlockPartition &part, 
     print_json_string(out, part.name);
     out << ",\n";
     out << next << "\"size_bytes\": " << part.size_bytes << ",\n";
-    out << next << "\"read_only\": " << (part.read_only ? "true" : "false") << ",\n";
     out << next << "\"mountpoints\": [";
     for (size_t i = 0; i < part.mountpoints.size(); ++i) {
         if (i) {
@@ -771,7 +767,6 @@ void render_json_block_device(std::ostream &out, const BlockDevice &block, int i
     print_json_string(out, block.name);
     out << ",\n";
     out << next << "\"size_bytes\": " << block.size_bytes << ",\n";
-    out << next << "\"read_only\": " << (block.read_only ? "true" : "false") << ",\n";
     out << next << "\"removable\": " << (block.removable ? "true" : "false") << ",\n";
     out << next << "\"mountpoints\": [";
     for (size_t i = 0; i < block.mountpoints.size(); ++i) {
@@ -809,6 +804,7 @@ void render_json_active_device(std::ostream &out, const ActiveDevice &device, in
     out << next << "\"pid\": ";
     print_json_string(out, device.pid);
     out << ",\n";
+    out << next << "\"authorized\": " << (device.authorized ? "true" : "false") << ",\n";
     out << next << "\"whitelisted\": " << (device.whitelisted ? "true" : "false") << ",\n";
     out << next << "\"connect_count\": " << device.connect_count << ",\n";
     out << next << "\"connected_for_ms\": " << device.connected_for_ms << ",\n";
@@ -933,6 +929,7 @@ void render_text(const StatusSnapshot &status, const std::vector<std::string> &a
             std::cout << "   Product: " << device.manufacturer << " / "
                       << device.product << "\n";
             std::cout << "   Serial: " << device.serial << "\n";
+            std::cout << "   Authorization: " << authorization_label(device) << "\n";
             std::cout << "   Connects: " << device.connect_count
                       << " | Current: " << format_duration_ms(device.connected_for_ms)
                       << " | Total: " << format_duration_ms(device.total_connected_ms)
@@ -946,7 +943,6 @@ void render_text(const StatusSnapshot &status, const std::vector<std::string> &a
             for (const auto &block : device.block_devices) {
                 std::cout << "   Block: " << block.name
                           << " | size=" << format_size(block.size_bytes)
-                          << " | ro=" << (block.read_only ? "yes" : "no")
                           << " | mounts=";
                 if (block.mountpoints.empty()) {
                     std::cout << "(none)\n";
@@ -963,7 +959,6 @@ void render_text(const StatusSnapshot &status, const std::vector<std::string> &a
                 for (const auto &part : block.partitions) {
                     std::cout << "     Partition: " << part.name
                               << " | size=" << format_size(part.size_bytes)
-                              << " | ro=" << (part.read_only ? "yes" : "no")
                               << " | mounts=";
                     if (part.mountpoints.empty()) {
                         std::cout << "(none)\n";
@@ -1035,6 +1030,20 @@ bool whitelist_policy_active(const StatusSnapshot &status) {
     return normalized_policy_mode(status) == "whitelist";
 }
 
+std::string authorization_label(const ActiveDevice &device) {
+    if (!device.authorization_supported) {
+        return "unknown";
+    }
+    return device.authorized ? "authorized" : "deauthorized";
+}
+
+TuiStyle authorization_style(const ActiveDevice &device) {
+    if (!device.authorization_supported) {
+        return TuiStyle::Muted;
+    }
+    return device.authorized ? TuiStyle::Good : TuiStyle::Warn;
+}
+
 std::string device_trust_label(const StatusSnapshot &status, bool whitelisted) {
     if (!whitelist_policy_active(status)) {
         return "monitor-only";
@@ -1053,8 +1062,8 @@ TuiStyle action_style(const std::string &action) {
     if (starts_with(action, "failed") || starts_with(action, "warn ")) {
         return TuiStyle::Warn;
     }
-    if (starts_with(action, "[dry-run]")) {
-        return TuiStyle::Accent;
+    if (starts_with(action, "deauthorized")) {
+        return TuiStyle::Warn;
     }
     if (starts_with(action, "applied")) {
         return TuiStyle::Good;
@@ -1129,10 +1138,12 @@ std::vector<TuiLine> build_left_panel_lines(const StatusSnapshot &status,
 
         std::ostringstream detail;
         detail << "   " << device_trust_label(status, device.whitelisted)
+               << " | " << authorization_label(device)
                << " | " << device.product;
         lines.push_back({detail.str(),
                          selected ? TuiStyle::Selected
-                                  : device_trust_style(status, device.whitelisted)});
+                                  : (!device.authorized ? TuiStyle::Warn
+                                                        : device_trust_style(status, device.whitelisted))});
 
         std::ostringstream stat;
         stat << "   count=" << device.connect_count
@@ -1179,6 +1190,8 @@ std::vector<TuiLine> build_overview_lines(const StatusSnapshot &status, int sele
     append_wrapped_tui_line(lines, "VID:PID: " + device.vid + ":" + device.pid, width);
     append_wrapped_tui_line(lines, "Trust: " + device_trust_label(status, device.whitelisted),
                             width, device_trust_style(status, device.whitelisted));
+    append_wrapped_tui_line(lines, "Authorization: " + authorization_label(device), width,
+                            authorization_style(device));
     append_wrapped_tui_line(lines, "Manufacturer: " + device.manufacturer, width);
     append_wrapped_tui_line(lines, "Product: " + device.product, width);
     append_wrapped_tui_line(lines, "Serial: " + device.serial, width);
@@ -1196,10 +1209,8 @@ std::vector<TuiLine> build_overview_lines(const StatusSnapshot &status, int sele
     } else {
         for (const auto &block : device.block_devices) {
             std::ostringstream summary;
-            summary << block.name << " | " << format_size(block.size_bytes)
-                    << " | ro=" << (block.read_only ? "yes" : "no");
-            append_wrapped_tui_line(lines, summary.str(), width,
-                                    block.read_only ? TuiStyle::Warn : TuiStyle::Normal);
+            summary << block.name << " | " << format_size(block.size_bytes);
+            append_wrapped_tui_line(lines, summary.str(), width, TuiStyle::Normal);
 
             std::string mounts = block.mountpoints.empty() ? "(none)" : "";
             if (!block.mountpoints.empty()) {
@@ -1214,8 +1225,7 @@ std::vector<TuiLine> build_overview_lines(const StatusSnapshot &status, int sele
 
             for (const auto &part : block.partitions) {
                 std::ostringstream partition_summary;
-                partition_summary << part.name << " | " << format_size(part.size_bytes)
-                                  << " | ro=" << (part.read_only ? "yes" : "no");
+                partition_summary << part.name << " | " << format_size(part.size_bytes);
                 append_wrapped_tui_line(lines, partition_summary.str(), width, TuiStyle::Muted);
             }
         }
@@ -1263,16 +1273,13 @@ std::vector<TuiLine> build_action_lines(const std::vector<std::string> &actions,
     append_wrapped_tui_line(lines, "Actions", width, TuiStyle::Accent);
     append_wrapped_tui_line(
         lines,
-        "Trang nay hien thi cac hanh dong policy o user space, vi du dat read-only cho USB ngoai whitelist.",
+        "Trang nay hien thi cac hanh dong policy o user space, vi du deauthorize cho USB ngoai whitelist.",
         width, TuiStyle::Muted);
     append_blank_tui_line(lines);
 
     if (actions.empty()) {
         append_wrapped_tui_line(lines,
-                                "Chua co action moi. Neu can, chay voi --readonly-untrusted.",
-                                width, TuiStyle::Muted);
-        append_wrapped_tui_line(lines,
-                                "Tip: dung --dry-run de xem truoc cac thay doi.",
+                                "Chua co action moi. Neu can, chay voi --deauthorize-untrusted.",
                                 width, TuiStyle::Muted);
         return lines;
     }
@@ -1399,10 +1406,8 @@ void render_tui(const StatusSnapshot &status, const std::vector<std::string> &ac
     std::ostringstream meta;
     meta << " Status: " << options.status_file.string()
          << " | Policy: "
-         << (options.readonly_untrusted
-                 ? (options.dry_run ? "readonly-untrusted (dry-run)"
-                                    : "readonly-untrusted (live)")
-                 : "observe only");
+         << (options.deauthorize_untrusted ? "deauthorize-untrusted"
+                                           : "observe only");
     render_tui_cell(meta.str(), term.cols, TuiStyle::Muted);
     std::cout << "\n";
     render_tui_cell(" q quit | j/k move | h/l page | Tab next tab | r refresh | x close popup ",
@@ -1460,8 +1465,7 @@ void print_usage(const char *progname) {
         << "  --watch <seconds>          Theo doi lien tuc theo chu ky giay\n"
         << "  --tui                      Giao dien TUI terminal realtime, co tab Overview/History/Actions\n"
         << "  --json                     Xuat JSON\n"
-        << "  --readonly-untrusted       Thu dat block device cua USB ngoai whitelist sang read-only khi policy whitelist dang bat\n"
-        << "  --dry-run                  Chi mo phong, khong ghi vao sysfs\n"
+        << "  --deauthorize-untrusted    Ghi 0 vao /sys/bus/usb/devices/<devpath>/authorized cho USB ngoai whitelist\n"
         << "  --help                     Hien tro giup\n";
 }
 
@@ -1484,10 +1488,8 @@ Options parse_args(int argc, char **argv) {
             options.tui = true;
         } else if (arg == "--json") {
             options.json = true;
-        } else if (arg == "--readonly-untrusted") {
-            options.readonly_untrusted = true;
-        } else if (arg == "--dry-run") {
-            options.dry_run = true;
+        } else if (arg == "--deauthorize-untrusted") {
+            options.deauthorize_untrusted = true;
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -1503,14 +1505,16 @@ int run_once(const Options &options) {
     StatusSnapshot status = load_status(options.status_file, true);
     std::vector<std::string> actions;
 
-    if (options.readonly_untrusted && !options.dry_run &&
+    if (options.deauthorize_untrusted &&
         whitelist_policy_active(status) && geteuid() != 0) {
         throw std::runtime_error(
-            "Can chay bang quyen root neu muon ap chinh sach read-only.");
+            "Can chay bang quyen root neu muon ap chinh sach cho USB ngoai whitelist.");
     }
 
-    if (options.readonly_untrusted) {
-        actions = apply_readonly_policy(status, options.dry_run);
+    if (options.deauthorize_untrusted) {
+        actions = apply_deauthorize_policy(status);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        status = load_status(options.status_file, true);
     }
 
     if (options.json) {
@@ -1624,14 +1628,16 @@ int run_tui(const Options &options) {
             StatusSnapshot status = load_status(options.status_file, true);
             std::vector<std::string> actions;
 
-            if (options.readonly_untrusted && !options.dry_run &&
+            if (options.deauthorize_untrusted &&
                 whitelist_policy_active(status) && geteuid() != 0) {
                 throw std::runtime_error(
-                    "Can chay bang quyen root neu muon ap chinh sach read-only.");
+                    "Can chay bang quyen root neu muon ap chinh sach cho USB ngoai whitelist.");
             }
 
-            if (options.readonly_untrusted) {
-                actions = apply_readonly_policy(status, options.dry_run);
+            if (options.deauthorize_untrusted) {
+                actions = apply_deauthorize_policy(status);
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                status = load_status(options.status_file, true);
             }
 
             const std::string signature = build_actions_signature(actions);
@@ -1688,15 +1694,16 @@ int run_watch(const Options &options) {
         try {
             StatusSnapshot status = load_status(options.status_file, true);
             std::vector<std::string> actions;
-            if (options.readonly_untrusted && !options.dry_run &&
+            if (options.deauthorize_untrusted &&
                 whitelist_policy_active(status) && geteuid() != 0) {
                 throw std::runtime_error(
-                    "Can chay bang quyen root neu muon ap chinh sach read-only.");
+                    "Can chay bang quyen root neu muon ap chinh sach cho USB ngoai whitelist.");
             }
-            if (options.readonly_untrusted) {
-                actions = apply_readonly_policy(status, options.dry_run);
+            if (options.deauthorize_untrusted) {
+                actions = apply_deauthorize_policy(status);
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                status = load_status(options.status_file, true);
             }
-
             std::cout << "\033[2J\033[H";
             const auto now = std::chrono::system_clock::to_time_t(
                 std::chrono::system_clock::now());

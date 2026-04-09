@@ -1,0 +1,24 @@
+.codex
+**/.codex
+
+# Editor and OS noise
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Kernel module build artifacts
+**/*.o
+**/*.ko
+**/*.mod
+**/*.mod.c
+**/*.mod.o
+**/Module.symvers
+**/modules.order
+**/.*.cmd
+**/.tmp_versions/
+
+# User-space build outputs
+/bai_2/usb_guard_monitor
+/bai_2/usb_guard_gui

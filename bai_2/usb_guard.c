@@ -5,17 +5,22 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/fs.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 
 #define USB_GUARD_NAME "usb_guard"
 #define USB_GUARD_PROC_DIR "usb_guard"
 #define USB_GUARD_PROC_STATUS "status"
+#define USB_GUARD_PROC_CONTROL "control"
 #define USB_GUARD_MAX_WHITELIST 32
 #define USB_GUARD_STRING_LEN 64
+#define USB_GUARD_PATH_LEN 128
 #define USB_GUARD_UNKNOWN "N/A"
 #define USB_GUARD_POLICY_OBSERVE "observe"
 #define USB_GUARD_POLICY_WHITELIST "whitelist"
@@ -66,10 +71,20 @@ struct usb_guard_seed_ctx {
 	int ret;
 };
 
+struct usb_guard_block_work {
+	struct work_struct work;
+	struct usb_guard_device_info info;
+};
+
 static char *usb_guard_whitelist_param;
 module_param_named(whitelist, usb_guard_whitelist_param, charp, 0444);
 MODULE_PARM_DESC(whitelist,
 		 "Danh sach whitelist USB mass storage theo dinh dang VVVV:PPPP[:SERIAL],...");
+
+static bool usb_guard_block_untrusted = true;
+module_param_named(block_untrusted, usb_guard_block_untrusted, bool, 0644);
+MODULE_PARM_DESC(block_untrusted,
+		 "Tu dong deauthorize USB mass storage ngoai whitelist bang authorized=0");
 
 static LIST_HEAD(usb_guard_active_devices);
 static LIST_HEAD(usb_guard_history_devices);
@@ -77,14 +92,23 @@ static DEFINE_MUTEX(usb_guard_lock);
 
 static struct proc_dir_entry *usb_guard_proc_dir;
 static struct proc_dir_entry *usb_guard_proc_status;
+static struct proc_dir_entry *usb_guard_proc_control;
 
 static struct usb_guard_rule usb_guard_whitelist_rules[USB_GUARD_MAX_WHITELIST];
 static unsigned int usb_guard_whitelist_count;
 static bool usb_guard_whitelist_enabled;
+static struct workqueue_struct *usb_guard_block_wq;
 
 static struct usb_guard_device_info usb_guard_last_device;
 static bool usb_guard_has_last_device;
 static char usb_guard_last_event[8] = "none";
+
+static bool usb_guard_match_whitelist_locked(u16 vendor_id, u16 product_id,
+					     const char *serial, bool has_serial);
+static void usb_guard_block_workfn(struct work_struct *work);
+static void usb_guard_schedule_block_locked(const struct usb_guard_device_info *info);
+static void usb_guard_schedule_blocks_for_active_locked(void);
+
 
 static void usb_guard_clear_device_info(struct usb_guard_device_info *info)
 {
@@ -118,8 +142,48 @@ static const char *usb_guard_policy_mode(void)
 					     USB_GUARD_POLICY_OBSERVE;
 }
 
-static bool usb_guard_match_whitelist(u16 vendor_id, u16 product_id,
-				      const char *serial, bool has_serial)
+static bool usb_guard_should_block_untrusted_locked(const struct usb_guard_device_info *info)
+{
+	if (!usb_guard_block_untrusted || !usb_guard_whitelist_enabled)
+		return false;
+
+	return !usb_guard_match_whitelist_locked(info->vendor_id, info->product_id,
+						 info->serial, info->has_serial);
+}
+
+static void usb_guard_schedule_block_locked(const struct usb_guard_device_info *info)
+{
+	struct usb_guard_block_work *block_work;
+
+	if (!usb_guard_block_wq || !usb_guard_should_block_untrusted_locked(info))
+		return;
+
+	block_work = kzalloc(sizeof(*block_work), GFP_KERNEL);
+	if (!block_work) {
+		pr_err("%s: khong the cap phat block work cho %s\n",
+		       USB_GUARD_NAME, info->devpath);
+		return;
+	}
+
+	INIT_WORK(&block_work->work, usb_guard_block_workfn);
+	block_work->info = *info;
+	queue_work(usb_guard_block_wq, &block_work->work);
+
+	pr_warn("%s: xep lich deauthorize USB ngoai whitelist devpath=%s vid=%04x pid=%04x serial=\"%s\"\n",
+		USB_GUARD_NAME, info->devpath, info->vendor_id,
+		info->product_id, info->serial);
+}
+
+static void usb_guard_schedule_blocks_for_active_locked(void)
+{
+	struct usb_guard_device_entry *entry;
+
+	list_for_each_entry(entry, &usb_guard_active_devices, node)
+		usb_guard_schedule_block_locked(&entry->info);
+}
+
+static bool usb_guard_match_whitelist_locked(u16 vendor_id, u16 product_id,
+					     const char *serial, bool has_serial)
 {
 	unsigned int i;
 
@@ -140,6 +204,164 @@ static bool usb_guard_match_whitelist(u16 vendor_id, u16 product_id,
 	}
 
 	return false;
+}
+
+static bool usb_guard_match_whitelist(u16 vendor_id, u16 product_id,
+				      const char *serial, bool has_serial)
+{
+	bool matched;
+
+	mutex_lock(&usb_guard_lock);
+	matched = usb_guard_match_whitelist_locked(vendor_id, product_id,
+						 serial, has_serial);
+	mutex_unlock(&usb_guard_lock);
+
+	return matched;
+}
+
+static bool usb_guard_rule_equals(const struct usb_guard_rule *lhs,
+				  const struct usb_guard_rule *rhs)
+{
+	if (lhs->vendor_id != rhs->vendor_id ||
+	    lhs->product_id != rhs->product_id ||
+	    lhs->has_serial != rhs->has_serial)
+		return false;
+
+	if (!lhs->has_serial)
+		return true;
+
+	return !strncmp(lhs->serial, rhs->serial, sizeof(lhs->serial));
+}
+
+static void usb_guard_recalculate_whitelist_state_locked(void)
+{
+	struct usb_guard_device_entry *entry;
+
+	usb_guard_whitelist_enabled = usb_guard_whitelist_count > 0;
+
+	list_for_each_entry(entry, &usb_guard_active_devices, node)
+		entry->info.whitelisted =
+			usb_guard_match_whitelist_locked(entry->info.vendor_id,
+							 entry->info.product_id,
+							 entry->info.serial,
+							 entry->info.has_serial);
+
+	if (usb_guard_has_last_device)
+		usb_guard_last_device.whitelisted =
+			usb_guard_match_whitelist_locked(usb_guard_last_device.vendor_id,
+							 usb_guard_last_device.product_id,
+							 usb_guard_last_device.serial,
+							 usb_guard_last_device.has_serial);
+
+	if (usb_guard_block_untrusted && usb_guard_whitelist_enabled)
+		usb_guard_schedule_blocks_for_active_locked();
+}
+
+static int usb_guard_find_rule_locked(const struct usb_guard_rule *rule)
+{
+	unsigned int i;
+
+	for (i = 0; i < usb_guard_whitelist_count; i++) {
+		if (usb_guard_rule_equals(&usb_guard_whitelist_rules[i], rule))
+			return (int)i;
+	}
+
+	return -ENOENT;
+}
+
+static void usb_guard_format_rule(const struct usb_guard_rule *rule, char *buffer,
+				  size_t buffer_size)
+{
+	if (rule->has_serial)
+		snprintf(buffer, buffer_size, "%04x:%04x:%s",
+			 rule->vendor_id, rule->product_id, rule->serial);
+	else
+		snprintf(buffer, buffer_size, "%04x:%04x",
+			 rule->vendor_id, rule->product_id);
+}
+
+static int usb_guard_add_rule(const struct usb_guard_rule *rule)
+{
+	char rule_text[USB_GUARD_STRING_LEN + 16];
+	int ret = 0;
+
+	mutex_lock(&usb_guard_lock);
+
+	if (usb_guard_whitelist_count >= USB_GUARD_MAX_WHITELIST) {
+		ret = -ENOSPC;
+		goto out_unlock;
+	}
+
+	if (usb_guard_find_rule_locked(rule) >= 0) {
+		ret = -EEXIST;
+		goto out_unlock;
+	}
+
+	usb_guard_whitelist_rules[usb_guard_whitelist_count++] = *rule;
+	usb_guard_recalculate_whitelist_state_locked();
+
+out_unlock:
+	mutex_unlock(&usb_guard_lock);
+
+	if (!ret) {
+		usb_guard_format_rule(rule, rule_text, sizeof(rule_text));
+		pr_info("%s: da them whitelist rule %s\n",
+			USB_GUARD_NAME, rule_text);
+	}
+
+	return ret;
+}
+
+static int usb_guard_remove_rule(const struct usb_guard_rule *rule)
+{
+	char rule_text[USB_GUARD_STRING_LEN + 16];
+	int index;
+
+	mutex_lock(&usb_guard_lock);
+
+	index = usb_guard_find_rule_locked(rule);
+	if (index < 0) {
+		mutex_unlock(&usb_guard_lock);
+		return index;
+	}
+
+	for (; index < (int)usb_guard_whitelist_count - 1; index++)
+		usb_guard_whitelist_rules[index] =
+			usb_guard_whitelist_rules[index + 1];
+
+	memset(&usb_guard_whitelist_rules[usb_guard_whitelist_count - 1], 0,
+	       sizeof(usb_guard_whitelist_rules[0]));
+	usb_guard_whitelist_count--;
+	usb_guard_recalculate_whitelist_state_locked();
+	mutex_unlock(&usb_guard_lock);
+
+	usb_guard_format_rule(rule, rule_text, sizeof(rule_text));
+	pr_info("%s: da xoa whitelist rule %s\n", USB_GUARD_NAME, rule_text);
+
+	return 0;
+}
+
+static void usb_guard_clear_whitelist_rules(void)
+{
+	mutex_lock(&usb_guard_lock);
+	memset(usb_guard_whitelist_rules, 0, sizeof(usb_guard_whitelist_rules));
+	usb_guard_whitelist_count = 0;
+	usb_guard_recalculate_whitelist_state_locked();
+	mutex_unlock(&usb_guard_lock);
+
+	pr_info("%s: da xoa toan bo whitelist runtime\n", USB_GUARD_NAME);
+}
+
+static void usb_guard_set_block_untrusted(bool enabled)
+{
+	mutex_lock(&usb_guard_lock);
+	usb_guard_block_untrusted = enabled;
+	if (usb_guard_block_untrusted && usb_guard_whitelist_enabled)
+		usb_guard_schedule_blocks_for_active_locked();
+	mutex_unlock(&usb_guard_lock);
+
+	pr_info("%s: che do tu dong deauthorize USB ngoai whitelist %s\n",
+		USB_GUARD_NAME, enabled ? "bat" : "tat");
 }
 
 static int usb_guard_parse_rule(char *token, struct usb_guard_rule *rule)
@@ -365,6 +587,53 @@ static void usb_guard_warn_untrusted(const struct usb_guard_device_info *info)
 		info->vendor_id, info->product_id, info->serial);
 }
 
+static void usb_guard_block_workfn(struct work_struct *work)
+{
+	struct usb_guard_block_work *block_work =
+		container_of(work, struct usb_guard_block_work, work);
+	struct file *file;
+	char path[USB_GUARD_PATH_LEN];
+	loff_t pos = 0;
+	ssize_t written;
+	bool should_block;
+
+	mutex_lock(&usb_guard_lock);
+	should_block = usb_guard_should_block_untrusted_locked(&block_work->info);
+	mutex_unlock(&usb_guard_lock);
+
+	if (!should_block) {
+		pr_info("%s: bo qua deauthorize devpath=%s vi chinh sach da thay doi\n",
+			USB_GUARD_NAME, block_work->info.devpath);
+		goto out_free;
+	}
+
+	snprintf(path, sizeof(path), "/sys/bus/usb/devices/%s/authorized",
+		 block_work->info.devpath);
+	file = filp_open(path, O_WRONLY, 0);
+	if (IS_ERR(file)) {
+		pr_err("%s: khong the mo %s de deauthorize (%ld)\n",
+		       USB_GUARD_NAME, path, PTR_ERR(file));
+		goto out_free;
+	}
+
+	written = kernel_write(file, "0\n", 2, &pos);
+	filp_close(file, NULL);
+
+	if (written != 2) {
+		pr_err("%s: ghi authorized=0 that bai cho %s (ret=%zd)\n",
+		       USB_GUARD_NAME, path, written);
+		goto out_free;
+	}
+
+	pr_warn("%s: da deauthorize USB ngoai whitelist devpath=%s vid=%04x pid=%04x serial=\"%s\"\n",
+		USB_GUARD_NAME, block_work->info.devpath,
+		block_work->info.vendor_id, block_work->info.product_id,
+		block_work->info.serial);
+
+out_free:
+	kfree(block_work);
+}
+
 static struct usb_guard_device_entry *
 usb_guard_find_device_locked(u8 busnum, const char *devpath)
 {
@@ -518,6 +787,9 @@ static void usb_guard_track_device(struct usb_device *udev, bool update_last,
 	}
 
 	usb_guard_warn_untrusted(&info);
+	mutex_lock(&usb_guard_lock);
+	usb_guard_schedule_block_locked(&stored_info);
+	mutex_unlock(&usb_guard_lock);
 
 	if (log_event)
 		usb_guard_log_event("add", &stored_info);
@@ -541,6 +813,9 @@ static int usb_guard_seed_one_device(struct usb_device *udev, void *data)
 	}
 
 	usb_guard_warn_untrusted(&info);
+	mutex_lock(&usb_guard_lock);
+	usb_guard_schedule_block_locked(&info);
+	mutex_unlock(&usb_guard_lock);
 
 	return 0;
 }
@@ -658,6 +933,8 @@ static int usb_guard_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "whitelist_enabled: %u\n",
 		   usb_guard_whitelist_enabled ? 1 : 0);
 	seq_printf(m, "policy_mode: %s\n", usb_guard_policy_mode());
+	seq_printf(m, "block_untrusted_enabled: %u\n",
+		   usb_guard_block_untrusted ? 1 : 0);
 	seq_puts(m, "whitelist_entries: ");
 	usb_guard_print_whitelist_entries(m);
 	seq_putc(m, '\n');
@@ -701,8 +978,132 @@ static int usb_guard_proc_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static int usb_guard_proc_control_show(struct seq_file *m, void *v)
+{
+	mutex_lock(&usb_guard_lock);
+	seq_puts(m, "commands:\n");
+	seq_puts(m, "  add VVVV:PPPP[:SERIAL]\n");
+	seq_puts(m, "  remove VVVV:PPPP[:SERIAL]\n");
+	seq_puts(m, "  clear\n");
+	seq_puts(m, "  block on|off\n");
+	seq_printf(m, "block_untrusted_enabled: %u\n",
+		   usb_guard_block_untrusted ? 1 : 0);
+	seq_puts(m, "current_whitelist: ");
+	usb_guard_print_whitelist_entries(m);
+	seq_putc(m, '\n');
+	mutex_unlock(&usb_guard_lock);
+
+	return 0;
+}
+
+static int usb_guard_proc_control_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, usb_guard_proc_control_show, NULL);
+}
+
+static ssize_t usb_guard_proc_control_write(struct file *file,
+					   const char __user *buffer,
+					   size_t count, loff_t *ppos)
+{
+	char *kbuf;
+	char *cursor;
+	char *arg = NULL;
+	struct usb_guard_rule rule;
+	int ret = 0;
+
+	if (count == 0)
+		return 0;
+
+	if (*ppos != 0)
+		return -EINVAL;
+
+	if (count > 256)
+		return -E2BIG;
+
+	kbuf = memdup_user_nul(buffer, count);
+	if (IS_ERR(kbuf))
+		return PTR_ERR(kbuf);
+
+	cursor = strim(kbuf);
+	if (!*cursor) {
+		ret = -EINVAL;
+		goto out_free;
+	}
+
+	arg = strpbrk(cursor, " \t");
+	if (arg) {
+		*arg = '\0';
+		arg = strim(arg + 1);
+	}
+
+	if (!strcmp(cursor, "add")) {
+		if (!arg || !*arg) {
+			ret = -EINVAL;
+			goto out_free;
+		}
+
+		ret = usb_guard_parse_rule(arg, &rule);
+		if (ret)
+			goto out_free;
+
+		ret = usb_guard_add_rule(&rule);
+	} else if (!strcmp(cursor, "remove")) {
+		if (!arg || !*arg) {
+			ret = -EINVAL;
+			goto out_free;
+		}
+
+		ret = usb_guard_parse_rule(arg, &rule);
+		if (ret)
+			goto out_free;
+
+		ret = usb_guard_remove_rule(&rule);
+	} else if (!strcmp(cursor, "clear")) {
+		usb_guard_clear_whitelist_rules();
+	} else if (!strcmp(cursor, "block")) {
+		if (!arg || !*arg) {
+			ret = -EINVAL;
+			goto out_free;
+		}
+
+		if (!strcmp(arg, "on") || !strcmp(arg, "1") ||
+		    !strcmp(arg, "enable")) {
+			usb_guard_set_block_untrusted(true);
+		} else if (!strcmp(arg, "off") || !strcmp(arg, "0") ||
+			   !strcmp(arg, "disable")) {
+			usb_guard_set_block_untrusted(false);
+		} else {
+			ret = -EINVAL;
+		}
+	} else {
+		ret = -EINVAL;
+	}
+
+out_free:
+	kfree(kbuf);
+
+	if (ret)
+		return ret;
+
+	*ppos += count;
+	return count;
+}
+
+static const struct proc_ops usb_guard_proc_control_ops = {
+	.proc_open = usb_guard_proc_control_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+	.proc_write = usb_guard_proc_control_write,
+};
+
 static void usb_guard_remove_proc_entries(void)
 {
+	if (usb_guard_proc_control) {
+		proc_remove(usb_guard_proc_control);
+		usb_guard_proc_control = NULL;
+	}
+
 	if (usb_guard_proc_status) {
 		proc_remove(usb_guard_proc_status);
 		usb_guard_proc_status = NULL;
@@ -744,6 +1145,15 @@ static void usb_guard_free_history_devices(void)
 	mutex_unlock(&usb_guard_lock);
 }
 
+static void usb_guard_destroy_block_wq(void)
+{
+	if (!usb_guard_block_wq)
+		return;
+
+	destroy_workqueue(usb_guard_block_wq);
+	usb_guard_block_wq = NULL;
+}
+
 static int __init usb_guard_init(void)
 {
 	int ret;
@@ -756,10 +1166,19 @@ static int __init usb_guard_init(void)
 	if (ret)
 		return ret;
 
+	usb_guard_block_wq = alloc_workqueue("usb_guard_block_wq",
+						 WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!usb_guard_block_wq) {
+		pr_err("%s: khong the tao workqueue deauthorize\n",
+		       USB_GUARD_NAME);
+		return -ENOMEM;
+	}
+
 	usb_guard_proc_dir = proc_mkdir(USB_GUARD_PROC_DIR, NULL);
 	if (!usb_guard_proc_dir) {
 		pr_err("%s: khong the tao /proc/%s\n", USB_GUARD_NAME,
 		       USB_GUARD_PROC_DIR);
+		usb_guard_destroy_block_wq();
 		return -ENOMEM;
 	}
 
@@ -772,6 +1191,19 @@ static int __init usb_guard_init(void)
 		pr_err("%s: khong the tao /proc/%s/%s\n", USB_GUARD_NAME,
 		       USB_GUARD_PROC_DIR, USB_GUARD_PROC_STATUS);
 		usb_guard_remove_proc_entries();
+		usb_guard_destroy_block_wq();
+		return -ENOMEM;
+	}
+
+	usb_guard_proc_control = proc_create_data(USB_GUARD_PROC_CONTROL, 0644,
+						 usb_guard_proc_dir,
+						 &usb_guard_proc_control_ops,
+						 NULL);
+	if (!usb_guard_proc_control) {
+		pr_err("%s: khong the tao /proc/%s/%s\n", USB_GUARD_NAME,
+		       USB_GUARD_PROC_DIR, USB_GUARD_PROC_CONTROL);
+		usb_guard_remove_proc_entries();
+		usb_guard_destroy_block_wq();
 		return -ENOMEM;
 	}
 
@@ -785,12 +1217,14 @@ static int __init usb_guard_init(void)
 		usb_guard_remove_proc_entries();
 		usb_guard_free_active_devices();
 		usb_guard_free_history_devices();
+		usb_guard_destroy_block_wq();
 		return ret;
 	}
 
-	pr_info("%s: da nap module, policy_mode=%s whitelist=%s\n",
+	pr_info("%s: da nap module, policy_mode=%s whitelist=%s block_untrusted=%s\n",
 		USB_GUARD_NAME, usb_guard_policy_mode(),
-		usb_guard_whitelist_enabled ? "enabled" : "disabled");
+		usb_guard_whitelist_enabled ? "enabled" : "disabled",
+		usb_guard_block_untrusted ? "enabled" : "disabled");
 
 	return 0;
 }
@@ -798,6 +1232,7 @@ static int __init usb_guard_init(void)
 static void __exit usb_guard_exit(void)
 {
 	usb_unregister_notify(&usb_guard_usb_nb);
+	usb_guard_destroy_block_wq();
 	usb_guard_remove_proc_entries();
 	usb_guard_free_active_devices();
 	usb_guard_free_history_devices();
