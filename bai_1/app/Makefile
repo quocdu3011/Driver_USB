@@ -5,7 +5,7 @@ CPPFLAGS += -D_DEFAULT_SOURCE -D_XOPEN_SOURCE=700 -I../driver
 CLI_TARGET := secure_file_app
 GUI_TARGET := secure_file_gui
 
-COMMON_SRCS := file_io.c driver_client.c hex_utils.c secure_file_service.c file_manager.c
+COMMON_SRCS := file_io.c driver_client.c hex_utils.c secure_file_service.c
 COMMON_OBJS := $(COMMON_SRCS:.c=.o)
 CLI_OBJS := main.o $(COMMON_OBJS)
 GUI_OBJS := gui_main.o $(COMMON_OBJS)
@@ -29,10 +29,10 @@ main.o: main.c secure_file_service.h ../driver/ioctl_defs.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 gui_main.o: check-gtk
-gui_main.o: gui_main.c file_manager.h secure_file_service.h ../driver/ioctl_defs.h
+gui_main.o: gui_main.c secure_file_service.h ../driver/ioctl_defs.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(GTK_CFLAGS) -c $< -o $@
 
-%.o: %.c file_io.h driver_client.h hex_utils.h secure_file_service.h file_manager.h ../driver/ioctl_defs.h
+%.o: %.c file_io.h driver_client.h hex_utils.h secure_file_service.h ../driver/ioctl_defs.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 clean:
