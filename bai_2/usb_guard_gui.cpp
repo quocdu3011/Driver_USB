@@ -2493,9 +2493,6 @@ void build_gui(GtkApplication *application, GuiState *state) {
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header), TRUE);
     gtk_header_bar_set_title(GTK_HEADER_BAR(header),
                              "USB Guard - Giám sát USB trên Ubuntu 64-bit");
-    gtk_header_bar_set_subtitle(
-        GTK_HEADER_BAR(header),
-        "Không thay thế usb-storage, chỉ mở rộng giám sát và chính sách");
     gtk_window_set_titlebar(GTK_WINDOW(state->window), header);
 
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
